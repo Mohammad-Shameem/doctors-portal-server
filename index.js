@@ -4,6 +4,10 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const { MongoClient, ServerApiVersion } = require("mongodb");
+const nodemailer = require("nodemailer"); //for send email to the user
+const mg = require("nodemailer-mailgun-transport"); //trmasfprter mailgun
+const ObjectId = require("mongodb").ObjectId;
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 //mongodb connection string
@@ -33,13 +37,71 @@ function verifyJWT(req, res, next) {
   const token = authHeader.split(" ")[1];
   jwt.verify(token, process.env.ACCESS_SECRET_CODE, function (err, decoded) {
     if (err) {
-      return res.status(403).send({ message: "Forbidden Access" });
+      return res
+        .status(403)
+        .send({ message: "Forbidden Access From VerifyJWT" });
     }
     req.decoded = decoded;
     next();
   });
 }
+const auth = {
+  auth: {
+    api_key: process.env.NODE_MAILER_API_KEY,
+    domain: process.env.MAILGUN_DOMAIN,
+  },
+};
+const nodemailerMailgun = nodemailer.createTransport(mg(auth));
 
+const sendAppointmentEmail = (booking) => {
+  const { treatmentName, date, slot, patientEmail, patientName, phone } =
+    booking;
+  nodemailerMailgun.sendMail(
+    {
+      from: "mehemetsaki789@gmail.com",
+      to: "takinahmad01@gmail.com",
+
+      subject: "Hey you, awesome!",
+      replyTo: "mehemetsaki789@gmail.com",
+
+      text: `Dear,${patientName}. you have an appointment in ${date} on ${slot}`,
+    },
+    (err, info) => {
+      if (err) {
+        console.log(err);
+      } else {
+        console.log(info);
+      }
+    }
+  );
+};
+
+const sendPaymentConfirmationEmail = (booking, payment) => {
+  const { treatmentName, date, slot, patientEmail, patientName, phone } =
+    booking;
+  nodemailerMailgun.sendMail(
+    {
+      from: "mehemetsaki789@gmail.com",
+      to: "takinahmad01@gmail.com",
+
+      subject: "Hey you, awesome!",
+      replyTo: "mehemetsaki789@gmail.com",
+
+      html: `   <div>
+     <p>Dear,${patientName}. you have an appointment in ${date} on ${slot}</p>
+     <p>We have recieved you payment for Appointment ${treatmentName}</p>
+     <p>Your Transaction id is ${payment.transactionId}</p>
+   </div>`,
+    },
+    (err, info) => {
+      if (err) {
+        console.log(err);
+      } else {
+        console.log(info);
+      }
+    }
+  );
+};
 async function run() {
   try {
     await client.connect();
@@ -50,10 +112,37 @@ async function run() {
       .db("doctors_portal")
       .collection("bookings");
     const usersCollection = client.db("doctors_portal").collection("users");
+    const doctorCollection = client.db("doctors_portal").collection("doctors");
+    const paymentsCollection = client
+      .db("doctors_portal")
+      .collection("payments");
 
+    const verifyAdmin = async (req, res, next) => {
+      const requester = req.decoded.email;
+      const requesterAccount = await usersCollection.findOne({
+        email: requester,
+      });
+      if (requesterAccount.role === "admin") {
+        next();
+      } else {
+        res.status(403).send({ message: "Forbidden Access" });
+      }
+    };
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const service = req.body;
+      const price = service.price;
+      const amount = price * 100; //ekhane amra price ta ke poysay convert korbo.
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({ clientSecret: paymentIntent.client_secret });
+    });
     app.get("/services", async (req, res) => {
       const query = {};
-      const cursor = servicesCollection.find(query);
+      const cursor = servicesCollection.find(query).project({ name: 1 });
       const services = await cursor.toArray();
       res.send(services);
     });
@@ -68,25 +157,15 @@ async function run() {
       const users = await usersCollection.find().toArray();
       res.send(users);
     });
-    app.put("/user/admin/:email", verifyJWT, async (req, res) => {
+    app.put("/user/admin/:email", verifyJWT, verifyAdmin, async (req, res) => {
       //ekhane amra same collection e er moddhe ekta role add korlam.
       const email = req.params.email;
-      const requester = req.decoded.email;
-      console.log("params email", email);
-      console.log("decoded requester", requester);
-      const requesterAccount = await usersCollection.findOne({
-        email: requester,
-      });
-      if (requesterAccount.role === "admin") {
-        const filter = { email: email };
-        const updateDoc = {
-          $set: { role: "admin" },
-        };
-        const result = await usersCollection.updateOne(filter, updateDoc);
-        res.send(result);
-      } else {
-        res.status(403).send({ message: "Forbidden Access" });
-      }
+      const filter = { email: email };
+      const updateDoc = {
+        $set: { role: "admin" },
+      };
+      const result = await usersCollection.updateOne(filter, updateDoc);
+      res.send(result);
     });
     //
     app.put("/user/:email", async (req, res) => {
@@ -118,6 +197,7 @@ async function run() {
       if (exists) {
         return res.send({ success: false, booking: exists });
       }
+      sendAppointmentEmail(booking);
       const result = await bookingCollection.insertOne(booking);
       return res.send({ success: true, result });
     });
@@ -158,6 +238,44 @@ async function run() {
         service.slots = available;
       });
       res.send(services);
+    });
+    app.get("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: ObjectId(id) };
+      const result = await bookingCollection.findOne(query);
+      res.send(result);
+    });
+    app.patch("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const payment = req.body;
+      const filter = { _id: ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          paid: true,
+          transactionId: payment.transactionId,
+        },
+      };
+      const updated = await bookingCollection.updateOne(filter, updateDoc);
+      const result = await paymentsCollection.insertOne(payment);
+      const booking = await bookingCollection.findOne(filter);
+      sendPaymentConfirmationEmail(booking, payment);
+      res.send({ updated, result }); //res ekadhik client site e pathate hole amader object akare pathate hobe.
+    });
+    app.post("/doctors", verifyJWT, verifyAdmin, async (req, res) => {
+      const doctor = req.body;
+      const result = await doctorCollection.insertOne(doctor);
+      res.send(result);
+    });
+    app.get("/doctors", verifyJWT, verifyAdmin, async (req, res) => {
+      const query = {};
+      const doctors = await doctorCollection.find(query).toArray();
+      res.send(doctors);
+    });
+    app.delete("/doctor/:email", verifyJWT, verifyAdmin, async (req, res) => {
+      const email = req.params.email;
+      const filter = { email: email };
+      const result = await doctorCollection.deleteOne(filter);
+      res.send(result);
     });
   } finally {
     // client.close()
